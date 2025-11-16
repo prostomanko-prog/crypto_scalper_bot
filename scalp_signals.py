@@ -1,223 +1,172 @@
 import requests
 from datetime import datetime
-import math
 
-BINANCE_URL = "https://api.binance.com"
+# Binance US — НЕ блокирует Railway
+BASE_URL = "https://api.binance.us"
 SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
-INTERVAL = "1m"     # таймфрейм
-LIMIT = 200         # сколько свечей брать (для индикаторов)
 
-# настройки стратегии
 RSI_PERIOD = 14
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+EMA_FAST = 12
+EMA_SLOW = 26
+EMA_SIGNAL = 9
 
 
-def get_klines(symbol: str, interval: str = INTERVAL, limit: int = LIMIT):
-    """Получаем свечи с Binance. Возвращаем список закрытий."""
-    url = f"{BINANCE_URL}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    resp = requests.get(url, params=params, timeout=5)
-    resp.raise_for_status()
-    data = resp.json()
-    closes = [float(candle[4]) for candle in data]  # close price = index 4
-    return closes
+def get_klines(symbol, interval="1m", limit=200):
+    """Загрузка свечей безопасно"""
+    try:
+        url = f"{BASE_URL}/api/v3/klines"
+        params = {"symbol": symbol, "interval": interval, "limit": limit}
+        r = requests.get(url, params=params, timeout=7)
+        data = r.json()
+        return [float(x[4]) for x in data]  # close prices
+    except Exception as e:
+        print(f"Error fetching klines for {symbol}: {e}")
+        return []
 
 
 def ema(values, period):
-    """Простая EMA без сторонних библиотек."""
     if len(values) < period:
         return None
-
     k = 2 / (period + 1)
-    ema_val = sum(values[:period]) / period  # SMA старт
-
+    ema_val = sum(values[:period]) / period
     for price in values[period:]:
         ema_val = price * k + ema_val * (1 - k)
-
     return ema_val
 
 
 def rsi(values, period=RSI_PERIOD):
-    """RSI по классической формуле."""
-    if len(values) <= period:
+    if len(values) < period + 2:
         return None
 
-    gains = []
-    losses = []
+    gains, losses = [], []
 
     for i in range(1, period + 1):
         diff = values[i] - values[i - 1]
-        if diff >= 0:
+        if diff > 0:
             gains.append(diff)
-            losses.append(0.0)
+            losses.append(0)
         else:
-            gains.append(0.0)
+            gains.append(0)
             losses.append(-diff)
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
-    if avg_loss == 0:
-        return 100.0
-
     for i in range(period + 1, len(values)):
         diff = values[i] - values[i - 1]
-        gain = diff if diff > 0 else 0.0
-        loss = -diff if diff < 0 else 0.0
+        gain = diff if diff > 0 else 0
+        loss = -diff if diff < 0 else 0
 
         avg_gain = (avg_gain * (period - 1) + gain) / period
         avg_loss = (avg_loss * (period - 1) + loss) / period
 
     if avg_loss == 0:
-        return 100.0
+        return 100
 
     rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    return round(100 - 100 / (1 + rs), 2)
 
 
-def macd(values, fast=MACD_FAST, slow=MACD_SLOW, signal_period=MACD_SIGNAL):
-    """MACD: возвращаем (macd_line, signal_line, hist)."""
-    if len(values) < slow + signal_period:
+def macd(values):
+    ef = ema(values, EMA_FAST)
+    es = ema(values, EMA_SLOW)
+    if ef is None or es is None:
         return None, None, None
 
-    ema_fast_val = ema(values, fast)
-    ema_slow_val = ema(values, slow)
+    macd_line = ef - es
 
-    if ema_fast_val is None or ema_slow_val is None:
-        return None, None, None
-
-    macd_line = ema_fast_val - ema_slow_val
-
-    # грубая оценка signal: считаем MACD на последних (slow + signal_period*2) свечах
+    # строим серию МАСД, чтобы брать сигнальную EMA
     macd_series = []
-    for i in range(len(values) - (slow + signal_period * 2), len(values)):
-        chunk = values[: i + 1]
-        ef = ema(chunk, fast)
-        es = ema(chunk, slow)
-        if ef is not None and es is not None:
-            macd_series.append(ef - es)
+    for i in range(len(values)):
+        ef_i = ema(values[: i + 1], EMA_FAST)
+        es_i = ema(values[: i + 1], EMA_SLOW)
+        if ef_i and es_i:
+            macd_series.append(ef_i - es_i)
 
-    if len(macd_series) < signal_period:
+    if len(macd_series) < EMA_SIGNAL:
         return macd_line, None, None
 
-    signal_line = ema(macd_series, signal_period)
-    hist = macd_line - signal_line if signal_line is not None else None
-
+    signal_line = ema(macd_series, EMA_SIGNAL)
+    hist = macd_line - signal_line
     return macd_line, signal_line, hist
 
 
-def define_trend(close_prices):
-    """Определяем тренд по EMA 50/200."""
-    ema_fast_trend = ema(close_prices, 50)
-    ema_slow_trend = ema(close_prices, 200)
-
-    if ema_fast_trend is None or ema_slow_trend is None:
+def get_trend(values):
+    ema50 = ema(values, 50)
+    ema200 = ema(values, 200)
+    if not ema50 or not ema200:
         return "SIDE"
-
-    if ema_fast_trend > ema_slow_trend * 1.001:
+    if ema50 > ema200:
         return "UP"
-    elif ema_fast_trend < ema_slow_trend * 0.999:
+    if ema50 < ema200:
         return "DOWN"
-    else:
-        return "SIDE"
+    return "SIDE"
 
 
-def build_levels(direction, price):
-    """Считаем SL / TP для LONG/SHORT."""
+def levels(direction, price):
     if direction == "LONG":
-        sl = price * 0.995    # -0.5%
-        tp1 = price * 1.003   # +0.3%
-        tp2 = price * 1.006   # +0.6%
+        sl = price * 0.995
+        tp1 = price * 1.003
+        tp2 = price * 1.006
     else:
-        sl = price * 1.005    # +0.5% против нас
-        tp1 = price * 0.997   # -0.3%
-        tp2 = price * 0.994   # -0.6%
+        sl = price * 1.005
+        tp1 = price * 0.997
+        tp2 = price * 0.994
 
-    # округление до разумного количества знаков
-    def rnd(x):
-        # если цена большая — меньше знаков
-        if x > 1000:
-            return round(x, 2)
-        elif x > 100:
-            return round(x, 3)
-        else:
-            return round(x, 4)
-
-    return rnd(sl), rnd(tp1), rnd(tp2)
+    return round(sl, 2), round(tp1, 2), round(tp2, 2)
 
 
-def generate_signal_for_symbol(symbol):
+def analyze(symbol):
     closes = get_klines(symbol)
-    last_price = closes[-1]
+    if not closes:
+        return None
 
-    trend = define_trend(closes)
+    last = closes[-1]
     rsi_val = rsi(closes)
     macd_line, signal_line, hist = macd(closes)
+    trend = get_trend(closes)
 
-    if rsi_val is None or macd_line is None or signal_line is None or hist is None:
-        return None  # данных мало
+    if None in (rsi_val, macd_line, signal_line, hist):
+        return None
 
     direction = None
 
-    # Условия для LONG
-    if (
-        trend == "UP"
-        and 40 <= rsi_val <= 65
-        and macd_line > signal_line
-        and hist > 0
-    ):
+    # Условия LONG
+    if trend == "UP" and rsi_val > 40 and hist > 0 and macd_line > signal_line:
         direction = "LONG"
 
-    # Условия для SHORT
-    if (
-        trend == "DOWN"
-        and 35 <= rsi_val <= 60
-        and macd_line < signal_line
-        and hist < 0
-    ):
+    # Условия SHORT
+    if trend == "DOWN" and rsi_val < 60 and hist < 0 and macd_line < signal_line:
         direction = "SHORT"
 
-    if direction is None:
+    if not direction:
         return None
 
-    sl, tp1, tp2 = build_levels(direction, last_price)
+    sl, tp1, tp2 = levels(direction, last)
 
-    # простое плечо и объём, можешь поменять как хочешь
-    leverage = 20 if symbol in ("BTCUSDT", "ETHUSDT") else 10
-    vol_mult = 4
-
-    sig = {
+    return {
         "symbol": symbol,
         "direction": direction,
-        "entry": last_price,
+        "entry": last,
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "leverage": leverage,
+        "leverage": 20 if symbol in ["BTCUSDT", "ETHUSDT"] else 10,
         "trend": trend,
-        "rsi": round(rsi_val, 2),
-        "macd": round(hist, 4),  # гистограмма — сила сигнала
-        "vol_mult": vol_mult,
+        "rsi": rsi_val,
+        "macd": round(hist, 4),
+        "vol_mult": 4,
         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }
-    return sig
 
 
 def generate_signals():
-    """
-    Главная функция, которую вызывает bot.py
-    Возвращает список сигналов (0, 1 или несколько).
-    """
-    signals = []
-    for symbol in SYMBOLS:
+    final = []
+    for s in SYMBOLS:
         try:
-            sig = generate_signal_for_symbol(symbol)
+            sig = analyze(s)
             if sig:
-                signals.append(sig)
+                final.append(sig)
         except Exception as e:
-            # чтобы ошибка по одному символу не завалила весь бот
-            print(f"Error while generating signal for {symbol}: {e}")
-
-    return signals
+            print(f"Signal error for {s}: {e}")
+    return final
