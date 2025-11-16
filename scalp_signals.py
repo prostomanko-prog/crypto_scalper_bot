@@ -1,26 +1,34 @@
 import requests
 from datetime import datetime
+import time
 
-# Binance US — НЕ блокирует Railway
-BASE_URL = "https://api.binance.us"
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+COINGECKO_URL = "https://api.coingecko.com/api/v3"
+SYMBOL_MAP = {
+    "BTCUSDT": "bitcoin",
+    "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana",
+    "XRPUSDT": "ripple"
+}
 
 RSI_PERIOD = 14
-EMA_FAST = 12
-EMA_SLOW = 26
-EMA_SIGNAL = 9
+FAST = 12
+SLOW = 26
+SIGNAL = 9
 
 
-def get_klines(symbol, interval="1m", limit=200):
-    """Загрузка свечей безопасно"""
+def get_prices(symbol_id, minutes=200):
+    """Берём исторические цены, CoinGecko даёт точку раз в минуту."""
     try:
-        url = f"{BASE_URL}/api/v3/klines"
-        params = {"symbol": symbol, "interval": interval, "limit": limit}
-        r = requests.get(url, params=params, timeout=7)
-        data = r.json()
-        return [float(x[4]) for x in data]  # close prices
+        url = f"{COINGECKO_URL}/coins/{symbol_id}/market_chart"
+        params = {"vs_currency": "usd", "days": 1}  # 24 часа истории
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()["prices"]
+
+        closes = [float(p[1]) for p in data][-minutes:]
+        return closes
+
     except Exception as e:
-        print(f"Error fetching klines for {symbol}: {e}")
+        print(f"Error fetching {symbol_id}: {e}")
         return []
 
 
@@ -35,27 +43,25 @@ def ema(values, period):
 
 
 def rsi(values, period=RSI_PERIOD):
-    if len(values) < period + 2:
+    if len(values) < period + 1:
         return None
 
     gains, losses = [], []
-
     for i in range(1, period + 1):
         diff = values[i] - values[i - 1]
-        if diff > 0:
-            gains.append(diff)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(-diff)
+        gains.append(diff if diff > 0 else 0)
+        losses.append(-diff if diff < 0 else 0)
 
     avg_gain = sum(gains) / period
     avg_loss = sum(losses) / period
 
+    if avg_loss == 0:
+        return 100
+
     for i in range(period + 1, len(values)):
         diff = values[i] - values[i - 1]
-        gain = diff if diff > 0 else 0
-        loss = -diff if diff < 0 else 0
+        gain = max(diff, 0)
+        loss = max(-diff, 0)
 
         avg_gain = (avg_gain * (period - 1) + gain) / period
         avg_loss = (avg_loss * (period - 1) + loss) / period
@@ -68,30 +74,30 @@ def rsi(values, period=RSI_PERIOD):
 
 
 def macd(values):
-    ef = ema(values, EMA_FAST)
-    es = ema(values, EMA_SLOW)
-    if ef is None or es is None:
+    ef = ema(values, FAST)
+    es = ema(values, SLOW)
+    if not ef or not es:
         return None, None, None
 
     macd_line = ef - es
 
-    # строим серию МАСД, чтобы брать сигнальную EMA
     macd_series = []
     for i in range(len(values)):
-        ef_i = ema(values[: i + 1], EMA_FAST)
-        es_i = ema(values[: i + 1], EMA_SLOW)
+        ef_i = ema(values[: i + 1], FAST)
+        es_i = ema(values[: i + 1], SLOW)
         if ef_i and es_i:
             macd_series.append(ef_i - es_i)
 
-    if len(macd_series) < EMA_SIGNAL:
+    if len(macd_series) < SIGNAL:
         return macd_line, None, None
 
-    signal_line = ema(macd_series, EMA_SIGNAL)
+    signal_line = ema(macd_series, SIGNAL)
     hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+
+    return macd_line, signal_line, round(hist, 4)
 
 
-def get_trend(values):
+def trend(values):
     ema50 = ema(values, 50)
     ema200 = ema(values, 200)
     if not ema50 or not ema200:
@@ -105,38 +111,32 @@ def get_trend(values):
 
 def levels(direction, price):
     if direction == "LONG":
-        sl = price * 0.995
-        tp1 = price * 1.003
-        tp2 = price * 1.006
+        return round(price * 0.995, 2), round(price * 1.003, 2), round(price * 1.006, 2)
     else:
-        sl = price * 1.005
-        tp1 = price * 0.997
-        tp2 = price * 0.994
-
-    return round(sl, 2), round(tp1, 2), round(tp2, 2)
+        return round(price * 1.005, 2), round(price * 0.997, 2), round(price * 0.994, 2)
 
 
 def analyze(symbol):
-    closes = get_klines(symbol)
-    if not closes:
+    symbol_id = SYMBOL_MAP[symbol]
+    closes = get_prices(symbol_id)
+
+    if len(closes) < 50:
         return None
 
     last = closes[-1]
-    rsi_val = rsi(closes)
-    macd_line, signal_line, hist = macd(closes)
-    trend = get_trend(closes)
+    r = rsi(closes)
+    m_line, s_line, hist = macd(closes)
+    tr = trend(closes)
 
-    if None in (rsi_val, macd_line, signal_line, hist):
+    if None in (r, m_line, s_line, hist):
         return None
 
     direction = None
 
-    # Условия LONG
-    if trend == "UP" and rsi_val > 40 and hist > 0 and macd_line > signal_line:
+    if tr == "UP" and r > 40 and hist > 0 and m_line > s_line:
         direction = "LONG"
 
-    # Условия SHORT
-    if trend == "DOWN" and rsi_val < 60 and hist < 0 and macd_line < signal_line:
+    if tr == "DOWN" and r < 60 and hist < 0 and m_line < s_line:
         direction = "SHORT"
 
     if not direction:
@@ -147,26 +147,26 @@ def analyze(symbol):
     return {
         "symbol": symbol,
         "direction": direction,
-        "entry": last,
+        "entry": round(last, 2),
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
         "leverage": 20 if symbol in ["BTCUSDT", "ETHUSDT"] else 10,
-        "trend": trend,
-        "rsi": rsi_val,
-        "macd": round(hist, 4),
+        "trend": tr,
+        "rsi": r,
+        "macd": hist,
         "vol_mult": 4,
         "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
 def generate_signals():
-    final = []
-    for s in SYMBOLS:
+    results = []
+    for sym in SYMBOLS:
         try:
-            sig = analyze(s)
+            sig = analyze(sym)
             if sig:
-                final.append(sig)
+                results.append(sig)
         except Exception as e:
-            print(f"Signal error for {s}: {e}")
-    return final
+            print(f"Signal error for {sym}: {e}")
+    return results
