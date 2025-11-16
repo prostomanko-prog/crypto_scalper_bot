@@ -1,14 +1,18 @@
 import requests
 from datetime import datetime
-import time
 
-COINGECKO_URL = "https://api.coingecko.com/api/v3"
+# ЧТО отслеживаем
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
+
+# соответствие тикеров CoinGecko
 SYMBOL_MAP = {
     "BTCUSDT": "bitcoin",
     "ETHUSDT": "ethereum",
     "SOLUSDT": "solana",
     "XRPUSDT": "ripple"
 }
+
+COINGECKO_URL = "https://api.coingecko.com/api/v3"
 
 RSI_PERIOD = 14
 FAST = 12
@@ -17,10 +21,10 @@ SIGNAL = 9
 
 
 def get_prices(symbol_id, minutes=200):
-    """Берём исторические цены, CoinGecko даёт точку раз в минуту."""
+    """Берём исторические цены с CoinGecko, интервал ~1 мин."""
     try:
         url = f"{COINGECKO_URL}/coins/{symbol_id}/market_chart"
-        params = {"vs_currency": "usd", "days": 1}  # 24 часа истории
+        params = {"vs_currency": "usd", "days": 1}
         r = requests.get(url, params=params, timeout=10)
         data = r.json()["prices"]
 
@@ -28,7 +32,7 @@ def get_prices(symbol_id, minutes=200):
         return closes
 
     except Exception as e:
-        print(f"Error fetching {symbol_id}: {e}")
+        print(f"Error fetching prices for {symbol_id}: {e}")
         return []
 
 
@@ -47,6 +51,7 @@ def rsi(values, period=RSI_PERIOD):
         return None
 
     gains, losses = [], []
+
     for i in range(1, period + 1):
         diff = values[i] - values[i - 1]
         gains.append(diff if diff > 0 else 0)
@@ -70,7 +75,7 @@ def rsi(values, period=RSI_PERIOD):
         return 100
 
     rs = avg_gain / avg_loss
-    return round(100 - 100 / (1 + rs), 2)
+    return round(100 - (100 / (1 + rs)), 2)
 
 
 def macd(values):
@@ -93,7 +98,6 @@ def macd(values):
 
     signal_line = ema(macd_series, SIGNAL)
     hist = macd_line - signal_line
-
     return macd_line, signal_line, round(hist, 4)
 
 
@@ -111,9 +115,15 @@ def trend(values):
 
 def levels(direction, price):
     if direction == "LONG":
-        return round(price * 0.995, 2), round(price * 1.003, 2), round(price * 1.006, 2)
+        sl = price * 0.995
+        tp1 = price * 1.003
+        tp2 = price * 1.006
     else:
-        return round(price * 1.005, 2), round(price * 0.997, 2), round(price * 0.994, 2)
+        sl = price * 1.005
+        tp1 = price * 0.997
+        tp2 = price * 0.994
+
+    return round(sl, 2), round(tp1, 2), round(tp2, 2)
 
 
 def analyze(symbol):
@@ -124,6 +134,7 @@ def analyze(symbol):
         return None
 
     last = closes[-1]
+
     r = rsi(closes)
     m_line, s_line, hist = macd(closes)
     tr = trend(closes)
